@@ -197,6 +197,21 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	}
 }
 
+size_t IGFX::wrapHwSetPanelPowerConfig(void* that, int arg0) {
+	// hwSetPanelPowerConfig doesn't have anything to do with the backlight control but it's a
+	// convenient place (low frequency call, and called in AppleIntelFramebufferController::start
+	// before backlight adjustments) to grab the initial c8254 value and patch it into the controller
+	// object.
+
+	uint32_t bxt_blc_pwm_freq1 = reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8254);
+	uint32_t* p_fbc_pwm_freq = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(that) + 0x2b44);
+	SYSLOG("igfx", "wrapHwSetPanelPowerConfig(): BXT_BLC_PWM_FREQ1=0x%x, AIFBC PWM freq=0x%x", bxt_blc_pwm_freq1, *p_fbc_pwm_freq);
+	if (bxt_blc_pwm_freq1)
+		*p_fbc_pwm_freq = bxt_blc_pwm_freq1;
+
+	return FunctionCast(wrapHwSetPanelPowerConfig, callbackIGFX->orgHwSetPanelPowerConfig)(that, arg0);
+}
+
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (currentGraphics && currentGraphics->loadIndex == index) {
 		if (pavpDisablePatch) {
@@ -227,6 +242,102 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 
 	if ((currentFramebuffer && currentFramebuffer->loadIndex == index) ||
 		(currentFramebufferOpt && currentFramebufferOpt->loadIndex == index)) {
+
+		if (currentFramebuffer == &kextIntelCFLFb) {
+			// Workaround a hardware bug (?) that causes the backlight to turn off for a couple minutes after
+			// changing the PWM divisor (MMIO register 0xc8254).
+			//
+			// Relevant MMIO registers:
+			// c8254 (BXT_BLC_PWM_FREQ1): PWM divisor
+			// c8258 (BXT_BLC_PWM_DUTY1): HW backlight level
+			// Backlight brightness will be approximately (BXT_BLC_PWM_DUTY1 / BXT_BLC_PWM_FREQ1).
+			//
+			// Relevant AppleIntelFramebufferController fields:
+			// this+0x2b38: uint32_t saved sw backlight value
+			// this+0x2b40: uint32_t divisor for sw backlight value (always 0xffff, set in getOSInformation)
+			// this+0x2b44: uint32_t max hw backlight value, written to reg 0xc8254 (always 0x56ce?)
+			//
+			// The bug is triggered when c8254 is changed. This register will be programmed to a valid,
+			// reasonable value by the system firmware, so we'll just patch that into the framebuffer
+			// controller object instead. Writes of the same value will not trigger the bug, and the
+			// controller will correctly compute the hardware backlight value using the original PWM
+			// divisor/scale factor (after some math patches -- see below).
+
+			// We will need to call the AppleIntelFramebufferController::ReadRegister32 function
+			orgReadRegister32 = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController14ReadRegister32Em", address, size);
+
+			// Hook hwSetPanelPowerConfig. We'll get the initial c8254 value when this function is called.
+			KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController21hwSetPanelPowerConfigEj" , wrapHwSetPanelPowerConfig, orgHwSetPanelPowerConfig);
+			patcher.routeMultiple(index, &request, 1, address, size);
+
+			// Patch the code to scale the software backlight value to the hardware value.
+			// Unfortunately, the math used to compute the brightness starts with a 32*32->32 multiply.
+			// The highest software brightness level is guaranteed to be 0xffff. If the existing PWM
+			// divisor is larger than 0xffff, this math will overflow and truncate the result when we
+			// patch that existing PWM divisor into the AppleIntelFramebufferController object.
+			//
+			// This is easier to fix than it looks, though. The current implementation of the 32*32->32
+			// multiply is to use the imul instruction (32*32->32 in eax) and then clear edx. The
+			// following div instruction reads edx:eax as the 64-bit numerator. All we have to do is
+			// switch to the (32*32->64 in edx:eax) form of imul and nop out the clearing of edx (with
+			// xor edx, edx) between the imul and div.
+			//
+			// There are 4 occurrences of this math code in the kext.
+
+			// AppleIntelFramebufferController::hwSetPanelPower
+			static const uint8_t divPatch1Find[] = {
+				0x41, 0x0F, 0xAF, 0x84, 0x24, 0x38, 0x2B, 0x00, 0x00, // imul eax, dword [r12 + 0x2b38] (32bit result version)
+				0x31, 0xD2,                                           // xor edx, edx
+			};
+			static const uint8_t divPatch1Repl[] = {
+				0x41, 0xF7, 0xAC, 0x24, 0x38, 0x2B, 0x00, 0x00,       // imul dword [r12 + 0x2b38] (64bit result version)
+				0x90, 0x90, 0x90,                                     // nop (3x)
+			};
+
+			// AppleIntelFramebufferController::hwSetBacklight
+			// (31 d2) xor edx, edx; (f7 b3 40 2b 00 00) div dword [rbx+0x2b40];
+			static const uint8_t divPatch2Find[] = {
+				0x41, 0x0F, 0xAF, 0xC6,                               // imul eax, r14d (32bit result version)
+				0x31, 0xD2,                                           // xor edx, edx
+			};
+			static const uint8_t divPatch2Repl[] = {
+				0x41, 0xf7, 0xee,                                     // imul r14d (64bit result version)
+				0x90, 0x90, 0x90,                                     // nop (3x)
+			};
+
+			// AppleIntelFramebufferController::LightUpEDP
+			static const uint8_t divPatch3Find[] = {
+				0x0F, 0xAF, 0x83, 0x38, 0x2B, 0x00, 0x00,             // imul eax, dword [rbx + 0x2b38] (32bit result version)
+				0x31, 0xD2,                                           // xor edx, edx
+			};
+			static const uint8_t divPatch3Repl[] = {
+				0xF7, 0xAB, 0x38, 0x2B, 0x00, 0x00,                   // imul dword [rbx + 0x2b38] (64bit result version)
+				0x90, 0x90, 0x90,                                     // nop (3x)
+			};
+
+			// CamelliaTcon2::DoRecoverFromTconResetTimer
+			static const uint8_t divPatch4Find[] = {
+				0x0F, 0xAF, 0x87, 0x38, 0x2B, 0x00, 0x00,             // imul eax, dword [rdi + 0x2b38] (32bit result version)
+				0x31, 0xD2,                                           // xor edx, edx
+			};
+			static const uint8_t divPatch4Repl[] = {
+				0xF7, 0xAF, 0x38, 0x2B, 0x00, 0x00,                   // imul dword [rdi + 0x2b38] (64bit result version)
+				0x90, 0x90, 0x90,                                     // nop (3x)
+			};
+
+			static const KernelPatcher::LookupPatch divPatches[] = {
+				{&kextIntelCFLFb, divPatch1Find, divPatch1Repl, sizeof(divPatch1Find), 1},
+				{&kextIntelCFLFb, divPatch2Find, divPatch2Repl, sizeof(divPatch2Find), 1},
+				{&kextIntelCFLFb, divPatch3Find, divPatch3Repl, sizeof(divPatch3Find), 1},
+				{&kextIntelCFLFb, divPatch4Find, divPatch4Repl, sizeof(divPatch4Find), 1},
+			};
+
+			for (size_t idx = 0; idx < arrsize(divPatches); ++idx) {
+				patcher.applyLookupPatch(&divPatches[idx]);
+			}
+
+		}
+
 		if (blackScreenPatch) {
 			KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController16ComputeLaneCountEPK29IODetailedTimingInformationV2jjPj", wrapComputeLaneCount, orgComputeLaneCount);
 			patcher.routeMultiple(index, &request, 1, address, size);

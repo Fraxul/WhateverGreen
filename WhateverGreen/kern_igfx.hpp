@@ -197,6 +197,16 @@ private:
 	mach_vm_address_t orgIgBufferGetGpuVirtualAddress {};
 
 	/**
+	 *	Original AppleIntelFramebufferController::ReadRegister32 function
+	 */
+	mach_vm_address_t orgReadRegister32 {};
+
+	/**
+	 *	Original AppleIntelFramebufferController::hwSetPanelPowerConfig function
+	 */
+	mach_vm_address_t orgHwSetPanelPowerConfig {};
+
+	/**
 	 *  Detected CPU generation of the host system
 	 */
 	CPUInfo::CpuGeneration cpuGeneration {};
@@ -320,6 +330,11 @@ private:
 	 *  IGHardwareGuC::loadGuCBinary wrapper to feed updated (compatible GuC)
 	 */
 	static bool wrapLoadGuCBinary(void *that, bool flag);
+
+	/**
+	 *	AppleIntelFramebufferController::hwSetPanelPowerConfig wrapper to fix backlight control on CFL platform
+	 */
+	static size_t wrapHwSetPanelPowerConfig(void* that, int arg0);
 
 	/**
 	 *  Actual firmware loader
