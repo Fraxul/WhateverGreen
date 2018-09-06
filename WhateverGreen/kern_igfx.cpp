@@ -197,6 +197,86 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	}
 }
 
+size_t IGFX::wrapWriteRegister32ForCFLBacklight(void* that, uint32_t reg, uint32_t value) {
+	static uint32_t hw_pwm_frequency = 0;
+	static uint32_t driver_requested_pwm_frequency = 0;
+
+	if (reg == 0xc8254) {
+		if (value) {
+			if (value != driver_requested_pwm_frequency) {
+				DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklight: driver requested BXT_BLC_PWM_FREQ1 = 0x%x", value);
+			}
+			driver_requested_pwm_frequency = value;
+		}
+		if (hw_pwm_frequency == 0) {
+			// Save the hardware PWM frequency as initially set up by the system firmware.
+			// We'll need this to restore later after system sleep.
+			hw_pwm_frequency = reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8254);
+			DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklight: system initialized BXT_BLC_PWM_FREQ1 = 0x%x", hw_pwm_frequency);
+		}
+		if (value) {
+			// Nonzero writes to this register need to use the original system value.
+			value = hw_pwm_frequency;
+		} else {
+			// The driver can safely write zero to this register as part of system sleep.
+		}
+	} else if (reg == 0xc8258) {
+		// Translate the PWM duty cycle between the driver scale value and the HW scale value
+		uint32_t rescaledValue = static_cast<uint32_t>((static_cast<float>(value) / static_cast<float>(driver_requested_pwm_frequency)) * static_cast<float>(hw_pwm_frequency));
+		DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklight: write [c8258] 0x%x/0x%x, rescaled to 0x%x/0x%x", value, driver_requested_pwm_frequency, rescaledValue, hw_pwm_frequency);
+		value = rescaledValue;
+	}
+
+	return FunctionCast(wrapWriteRegister32ForCFLBacklight, callbackIGFX->orgWriteRegister32)(that, reg, value);
+}
+
+size_t IGFX::wrapWriteRegister32ForCFLBacklightOnKBL(void* that, uint32_t reg, uint32_t value) {
+	static uint32_t hw_pwm_frequency = 0;
+	static uint32_t hw_pwm_control = 0;
+
+	if (reg == 0xc8250) {
+		if (hw_pwm_control == 0) {
+			// Save the original hardware PWM control value
+			hw_pwm_control = reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8250);
+		}
+
+		uint32_t previousValue = reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8250);
+		DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklightOnKBL: write [c8250] 0x%x, previous was 0x%x", value, previousValue);
+		if (value) {
+			// Set the PWM frequency before turning it on to avoid the 3 minute blackout bug
+			FunctionCast(wrapWriteRegister32ForCFLBacklightOnKBL, callbackIGFX->orgWriteRegister32)(that, 0xc8254, hw_pwm_frequency);
+
+			// Use the original hardware PWM control value.
+			value = hw_pwm_control;
+		}
+
+	} else if (reg == 0xc8254) {
+		if (hw_pwm_frequency == 0) {
+			// Populate the hardware PWM frequency as initially set up by the system firmware.
+			hw_pwm_frequency = reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8254);
+			DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklightOnKBL: system initialized [c8254] BXT_BLC_PWM_FREQ1 = 0x%x", hw_pwm_frequency);
+			DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklightOnKBL: system initialized [c8250] = 0x%x", reinterpret_cast<uint32_t(*)(void*, uint32_t)>(callbackIGFX->orgReadRegister32)(that, 0xc8250));
+		}
+
+		// For the KBL driver, 0xc8254 (BLC_PWM_PCH_CTL2) controls the backlight intensity. High 16 of this write are the denominator (frequency), low 16 are the numerator (duty cycle).
+		// Translate this into a write to c8258 (BXT_BLC_PWM_DUTY1) for the CFL hardware, scaled by the system-provided value in c8254 (BXT_BLC_PWM_FREQ1)
+		uint16_t frequency = (value & 0xffff0000) >> 16;
+		uint16_t dutyCycle = value & 0xffff;
+		uint32_t rescaledValue = static_cast<uint32_t>((static_cast<float>(dutyCycle) / static_cast<float>(frequency)) * static_cast<float>(hw_pwm_frequency));
+		DBGLOG("igfx", "wrapWriteRegister32ForCFLBacklightOnKBL: write [c8254] 0x%x/0x%x, rescaled to 0x%x/0x%x", dutyCycle, frequency, rescaledValue, hw_pwm_frequency);
+
+		// Reset the hardware PWM frequency. Write the original system value if the driver-requested value is nonzero. If the driver requests
+		// zero, we allow that, since it's trying to turn off the backlight PWM for sleep.
+		FunctionCast(wrapWriteRegister32ForCFLBacklightOnKBL, callbackIGFX->orgWriteRegister32)(that, 0xc8254, frequency ? hw_pwm_frequency : 0);
+
+		// Finish by writing the duty cycle
+		reg = 0xc8258; // BXT_BLC_PWM_DUTY1
+		value = rescaledValue;
+	}
+
+	return FunctionCast(wrapWriteRegister32ForCFLBacklightOnKBL, callbackIGFX->orgWriteRegister32)(that, reg, value);
+}
+
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (currentGraphics && currentGraphics->loadIndex == index) {
 		if (pavpDisablePatch) {
@@ -227,6 +307,60 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 
 	if ((currentFramebuffer && currentFramebuffer->loadIndex == index) ||
 		(currentFramebufferOpt && currentFramebufferOpt->loadIndex == index)) {
+
+		if (currentFramebuffer == &kextIntelCFLFb) {
+			// Workaround a hardware bug (?) that causes the backlight to turn off for a couple minutes after
+			// changing the PWM divisor (MMIO register 0xc8254).
+			//
+			// Relevant MMIO registers:
+			// c8254 (BXT_BLC_PWM_FREQ1): PWM divisor
+			// c8258 (BXT_BLC_PWM_DUTY1): HW backlight level
+			// Backlight brightness will be approximately (BXT_BLC_PWM_DUTY1 / BXT_BLC_PWM_FREQ1).
+			//
+			// We will need to call the AppleIntelFramebufferController::ReadRegister32 function
+			orgReadRegister32 = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController14ReadRegister32Em", address, size);
+
+			// We will need to route AppleIntelFramebufferController::WriteRegister32. This function was compiled with LLVM code coverage
+			// enabled and has an RIP-relative `inc` instruction right at the front, which will break when it gets moved to the trampoline
+			// segment. NOP this out first before routing.
+
+			auto regWrite = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController15WriteRegister32Emj", address, size);
+			if (regWrite) {
+				auto instCurr = regWrite;
+				for (size_t i = 0; i < 5; i++) {
+					auto instSize = Disassembler::quickInstructionSize(reinterpret_cast<mach_vm_address_t>(instCurr), 1);
+					if (instSize == 0) break; // Unknown instruction
+					uint8_t incPrefix[] {0x48, 0xFF, 0x05}; // inc qword ptr [rip + (disp32 in next 4 bytes)]
+					if (instSize == 7 && !memcmp(reinterpret_cast<void *>(instCurr), incPrefix, sizeof(incPrefix))) {
+						auto status = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
+						if (status == KERN_SUCCESS) {
+							for (size_t j = 0; j < 7; j++) reinterpret_cast<uint8_t *>(instCurr)[j] = 0x90; // nop
+							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+							DBGLOG("igfx", "AppleIntelFramebufferController::WriteRegister32 coverage instruction patched, we're cleared for routing.");
+						} else {
+							SYSLOG("igfx", "instruction change protection failure %d", status);
+						}
+					}
+					instCurr += instSize;
+				}
+			}
+
+			// Select an appropriate version of the fix depending on which driver is loaded.
+			if (currentFramebuffer->loadIndex == index) {
+				// CFL hardware running on the CFL driver.
+				KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController15WriteRegister32Emj" , wrapWriteRegister32ForCFLBacklight, orgWriteRegister32);
+				patcher.routeMultiple(index, &request, 1, address, size);
+
+			} else if ((currentFramebufferOpt == &kextIntelKBLFb) && (currentFramebufferOpt->loadIndex == index)) {
+				// Different workaround for CFL hardware running on the KBL driver.
+				KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController15WriteRegister32Emj" , wrapWriteRegister32ForCFLBacklightOnKBL, orgWriteRegister32);
+				patcher.routeMultiple(index, &request, 1, address, size);
+
+			} else {
+				SYSLOG("igfx", "CFL backlight patch is required but we don't have an implementation for the loaded driver combination\n");
+			}
+		}
+
 		if (blackScreenPatch) {
 			KernelPatcher::RouteRequest request("__ZN31AppleIntelFramebufferController16ComputeLaneCountEPK29IODetailedTimingInformationV2jjPj", wrapComputeLaneCount, orgComputeLaneCount);
 			patcher.routeMultiple(index, &request, 1, address, size);
